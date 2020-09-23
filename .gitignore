@@ -1,0 +1,6 @@
+config.txt
+src/catrack
+catrack
+deploy.fish
+db.sqlite3
+build/
