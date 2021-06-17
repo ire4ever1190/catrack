@@ -1,6 +1,6 @@
 type TVShow* = object
     poster_path*: string
-    popularity*: int
+    popularity*: float
     id*: int
     backdrop_path*: string
     vote_average*: float

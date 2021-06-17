@@ -5,11 +5,14 @@ import catrackpkg/tmdb
 import asyncdispatch
 import mike
 import json
+import std/jsonutils
 import models/scrobble
 import allographer/schema_builder
 import allographer/query_builder
+import base64
 import strutils
 import tables
+import std/sha1
 import regex
 import config
 
@@ -36,8 +39,18 @@ schema([
 proc getAccount(): TmdbAccount {.gcsafe.} = newTmdbAccount(apiKey)
 
 proc updateDB() {.async.} =
-        echo("updating shows")
         let account = getAccount()
+        echo "Adding new shows"
+        for show in await account.getList(TVShowList):
+            try:
+                RDB().table("show")
+                    .insert(%*{
+                        "name": show.name,
+                        "id": show.id
+                    })
+            except:
+                continue
+        echo("updating shows")
         for show in RDB().table("show").select("id").get():
             let showID = show["id"].getInt()
             # Get all previous episodes for the show
@@ -75,20 +88,6 @@ proc updateDB() {.async.} =
                     RDB().table("episode")
                         .insert(episodesToAdd)
         echo("Shows updated")
-        
-        echo("Updating movies")
-        for movie in await account.getList(145676):
-            try:
-                RDB().table("movie")
-                        .insert(%*{
-                            "id": movie.id,
-                            "name": movie.title,
-                            "status": 0
-                        })
-            except:
-                continue
-            
-        echo("Movies updated")
 
 proc updateService() {.async.} =
     while true:
@@ -96,6 +95,9 @@ proc updateService() {.async.} =
             await updateDB()
             await sleepAsync(60 * 60 * 60 * 4 * 1000)
         except:
+            let e = getCurrentException()
+            await sleepAsync(10000)
+            echo e.msg
             asyncCheck updateService()
             return
         
@@ -112,84 +114,107 @@ const
     indexFile = readFile("src/index.html")
     jsFile = readFile("src/index.js")
 
-status 404:
-    "<h1>404 you dummy</h1>"
+type
+    AuthContext = ref object of Context
+        authenticated: bool
 
-get "/":
-    addHeader("content-type", "text/html")
-    send indexFile
 
-get "/index.js":
-    addHeader("content-type", "text/javascript")
-    send jsFile
+# Http Basic Auth Implementation that I'm sure has zero issues
+beforeGet("/") do (ctx: AuthContext):
+    if ctx.hasHeader("Authorization"):
+        let creds = ctx.header("Authorization")
+            .replace("Basic ", "")
+            .decode()
+            .split(":")
+        ctx.authenticated = creds[0] == Username and creds[1] == Password
+    if not ctx.authenticated:
+        ctx.status(401)
+        ctx.header("WWW-Authenticate", "Basic realm=\"Who you?\"")
 
-get "/shows":
+let ApiToken = secureHash(Username & Password)
+get("/") do (ctx: AuthContext):
+    if ctx.authenticated:
+        ctx.response.headers["content-type"] = "text/html"
+        ctx.send indexFile.replace("APITOKEN", $ApiToken)
+
+get("/index.js") do ():
+    ctx.header("content-type", "text/javascript")
+    ctx.send jsFile
+
+get("/shows") do ():
     let dbResult = RDB().table("show").get()
-    echo(len($dbResult))
-    send dbResult
+    ctx.send %*dbResult
     
-get "/shows/uncollected":
+get("/shows/uncollected") do ():
     let dbResult = RDB().table("episode")
-        .select("show.name", "show.id", "episode.season", "episode.episode", "episode.airdate")
-        .where("episode.status", "=", "0")
-        .join("show", "episode.showID", "=", "show.id")
+        .join("show", "episode.showid", "=", "show.id")
+        .select("show.name", "episode.id", "episode.season", "episode.episode", "episode.airdate")
+        .where("episode.status", "=", 0)
         .get()
-    send dbResult
+    ctx.send %*dbResult
 
-get "/shows/calendar":
+get("/shows/calendar") do ():
     let episodes = RDB().table("episode")
             .select("show.name", "show.id", "episode.season", "episode.episode", "episode.airdate")
-            .where("episode.status", "=", "0")
+            .where("episode.status", "=", 0)
             .join("show", "episode.showID", "=", "show.id")
             .get()
-    var body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Cat Track//NONSGML v1.0//EN\r\n"
+    result = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Cat Track//NONSGML v1.0//EN\r\n"
     
     for episode in episodes:
-        body &= "BEGIN:VEVENT\r\n"
-        body &= "CATEGORIES:TV\r\n"
-        body &= "UID:" & episode["airdate"].str & $episode["season"].getInt() & $episode["episode"].getInt() & episode["name"].str & "\r\n"
-        body &= "METHOD:TV\r\n"
-        body &= "DTSTAMP:" & episode["airdate"].str.replace("-", "") & "T000000\r\n"
-        body &= "DTSTART:" & episode["airdate"].str.replace("-", "") & "T000000\r\n"
-        body &= "SUMMARY:" & episode["name"].str & "\r\n"
-        body &= "END:VEVENT\r\n"
-    body &= "END:VCALENDAR"
-    addHeader("content-type", "text/calendar")
-    send(body)
-             
+        result &= "BEGIN:VEVENT\r\n"
+        result &= "CATEGORIES:TV\r\n"
+        result &= "UID:" & episode["airdate"].str & $episode["season"].getInt() & $episode["episode"].getInt() & episode["name"].str & "\r\n"
+        result &= "METHOD:TV\r\n"
+        result &= "DTSTAMP:" & episode["airdate"].str.replace("-", "") & "T000000\r\n"
+        result &= "DTSTART:" & episode["airdate"].str.replace("-", "") & "T000000\r\n"
+        result &= "SUMMARY:" & episode["name"].str & "\r\n"
+        result &= "END:VEVENT\r\n"
+    result &= "END:VCALENDAR"
+    ctx.response.headers["content-type"] = "text/calendar"
 
-get "/movies/uncollected":
-    let dbResult = RDB().table("movie")
-        .select("id", "name")
-        .where("status", "=", "0")
-        .get()
-    send dbResult
+# why
+type
+    Episode = object
+        id: int
 
-post "/scrobble/movie":
-    let body = request.body
-    let payload = parseJson(body)
-    let movieID = payload["id"].getInt()
-    let status = payload["status"].getInt()
-    RDB().table("movie")
-        .where("id", "=", movieID)
-        .update(%*{
-            "status": status
-        })
-    
-post "/scrobble/show":
+put "/episode":
+    let token = ctx.header("token").parseSecureHash()
+    if token != ApiToken:
+        ctx.status(401)
+        return "Invalid token"
+    let episode = ctx.json(Episode)
+    RDB().table("episode")
+        .where("id", "=", episode.id)
+        .update(%*{"status": 1})
+
+post "/show":
+    let token = ctx.header("token").parseSecureHash()
+    if token != ApiToken:
+        ctx.status(401)
+        return "Invalid token"
     let account = getAccount()
-    let payload = json(Show)
+    let payload = ctx.json(Show)
     let showID = payload.tmdb_id
     if RDB().table("show").where("id", "=", showID).get() == @[]:
-        let showDetails = await account.getShowDetails(payload.tmdb_id.parseInt())
+        let showDetails = await account.getShowDetails(showID)
         RDB().table("show")
             .insert(%*{
                 "name": showDetails.name,
                 "id": showDetails.id
             })
+        let lastSeason = showDetails.seasons.len()
+        var index = 0
         for season in showDetails.seasons:
+            inc index
             if season.season_number == 0: continue
-            let seasonDetails = await account.getSeason(showID.parseInt(), season.season_number)
+            let seasonDetails = await account.getSeason(showID, season.season_number)
+            let status = block:
+                if payload.onlyLatestSeason and index != lastSeason:
+                    1
+                else:
+                    0
+
             for episode in seasonDetails.episodes:
                 RDB().table("episode")
                     .insert(%*{
@@ -198,23 +223,11 @@ post "/scrobble/show":
                         "season": season.season_number,
                         "episode": episode.episode_number,
                         "airdate": episode.airdate,
-                        "status": 0
+                        "status": status
                     })
-        
-        
-    for episode in payload.episodes:
-        try:
-            RDB().table("episode")
-                .where("showID", "=", showID)
-                .where("season", "=", episode.season)
-                .where("episode", "=", episode.episode)
-                .update(%*{
-                    "status": episode.status                    
-                })
-        except:
-            continue
-    send "OK"
+
+    ctx.send "OK"
     
 when isMainModule:
     asyncCheck updateService()
-    startServer(5000)
+    run(5000)
