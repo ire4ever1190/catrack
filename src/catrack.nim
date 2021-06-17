@@ -9,11 +9,13 @@ import std/jsonutils
 import models/scrobble
 import allographer/schema_builder
 import allographer/query_builder
+import catrackpkg/models/episode
 import base64
 import strutils
 import tables
 import std/sha1
 import regex
+import times
 import config
 
 schema([
@@ -38,6 +40,9 @@ schema([
 
 proc getAccount(): TmdbAccount {.gcsafe.} = newTmdbAccount(apiKey)
 
+proc olderThan(episode: Episode, duration: TimeInterval): bool =
+    episode.airdate.parse("yyyy-MM-dd", utc()) < now().utc - duration
+
 proc updateDB() {.async.} =
         let account = getAccount()
         echo "Adding new shows"
@@ -61,8 +66,10 @@ proc updateDB() {.async.} =
             let showDetails = await account.getShowDetails(showID)
             if not showDetails.in_production:
                 continue
-            
+            let seasonsCount = showDetails.seasons.len
+            var index = 0
             for season in showDetails.seasons:
+                inc index
                 if season.season_number == 0: continue # Ignore specials
                 let seasonDetails = await account.getSeason(showID, season.season_number)
                 var episodesToAdd = newSeq[JsonNode]() # Holds list of episodes for mass inserting
@@ -74,7 +81,10 @@ proc updateDB() {.async.} =
                                 "episode": episode.episode_number,
                                 "id": episode.id,
                                 "airdate": episode.airdate,
-                                "status": 0
+                                "status": if index != seasonsCount or episode.olderThan(2.weeks):
+                                            1
+                                        else:
+                                            0
                             })
                     else:
                         RDB().table("episode")
@@ -175,7 +185,7 @@ get("/shows/calendar") do ():
 
 # why
 type
-    Episode = object
+    SEpisode = object
         id: int
 
 put "/episode":
@@ -183,7 +193,7 @@ put "/episode":
     if token != ApiToken:
         ctx.status(401)
         return "Invalid token"
-    let episode = ctx.json(Episode)
+    let episode = ctx.json(SEpisode)
     RDB().table("episode")
         .where("id", "=", episode.id)
         .update(%*{"status": 1})

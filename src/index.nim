@@ -16,15 +16,9 @@ type Episode = object
     episode: int
     airdate: kstring
 
-var token {.importjs.}: cstring
+let token {.importjs.}: cstring
 var episodes: seq[Episode] = @[]
 let authHeader =  @{"token".cstring: token}
-proc addShow(id: int, onlyLatestSeason: bool) =
-    let body = cstring $(%* {"tmdbID": id, "onlyLatestSeason": onlyLatestSeason})
-    ajaxPost("/show", authHeader, body) do (status: int, data: kstring):
-        console.log(status)
-        console.log(data)
-
 proc getEpisodes() =
     ajaxGet("/shows/uncollected", @[],proc (_: int, data: kstring) =
         episodes = fromJson[seq[Episode]](data)
@@ -55,12 +49,6 @@ proc createDom(): VNode =
         getEpisodes()
     
     result = buildHtml(tdiv):
-        tdiv(class = "input-group"):
-            label(`for`="showID"):
-                text "TMDB ID"
-            input(`type`="text", id="showID", onchange = proc () =
-                addShow(parseInt(getVNodeById("showID").getInputText()), true)
-            )
         for episode in episodes:
             tdiv(class = "row"):
                 tdiv(class = "col-md-5 col-sm-12 col-md-offset-5"):
