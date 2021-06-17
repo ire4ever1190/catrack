@@ -4,3 +4,4 @@ catrack
 deploy.fish
 db.sqlite3
 build/
+src/index.js
